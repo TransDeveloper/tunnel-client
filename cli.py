@@ -22,7 +22,7 @@ from collections import deque
 import threading
 import queue
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
@@ -40,10 +40,16 @@ except ImportError:
 
 # ==================== Configuration ====================
 
-API = "http://tunnels.finnacloud.net:8000"
-KEY = os.getenv("finnaconnect_token")  # or read local user (~/.finnacloud/settings.yaml) config file
+API = "http://tunnels.finnacloud.net" # Do NOT change this to https right now, we do not support WSS but only WS.
 STREAMING_CHUNK_SIZE = 64 * 1024  # 64KB chunks for streaming
 MAX_REQUEST_HISTORY = 1000  # Maximum number of requests to keep in history
+
+# API key storage path
+API_KEY_FILE = os.path.expanduser("~/.finnacloud/api_key")
+API_KEY_DIR = os.path.expanduser("~/.finnacloud")
+
+# Global API key (set in main() after authentication)
+KEY: Optional[str] = None
 
 console = Console()
 
@@ -64,6 +70,9 @@ metrics = {
     "start_time": None,
 }
 
+# Tunnel info for display
+tunnel_info: Dict[str, str] = {}
+
 # Request/Response history for monitoring dashboard
 request_history: deque = deque(maxlen=MAX_REQUEST_HISTORY)
 request_history_lock = threading.Lock()
@@ -75,6 +84,133 @@ monitoring_queue: queue.Queue = queue.Queue()
 monitoring_server: Optional[web.Application] = None
 monitoring_runner: Optional[web.AppRunner] = None
 monitoring_websockets: List[web.WebSocketResponse] = []
+
+# ==================== API Key Management ====================
+
+def get_api_key() -> Optional[str]:
+    """Get API key from environment variable or local file"""
+    # First check environment variable
+    # env_key = os.getenv("finnaconnect_token")
+    # if env_key:
+    #     return env_key
+    
+    # Then check local file
+    if os.path.exists(API_KEY_FILE):
+        try:
+            with open(API_KEY_FILE, 'r') as f:
+                key = f.read().strip()
+                if key:
+                    return key
+        except Exception:
+            pass
+    
+    return None
+
+
+def save_api_key(api_key: str):
+    """Save API key to local file"""
+    try:
+        # Create directory if it doesn't exist
+        os.makedirs(API_KEY_DIR, mode=0o700, exist_ok=True)
+        
+        # Save API key with restricted permissions
+        with open(API_KEY_FILE, 'w') as f:
+            f.write(api_key)
+        
+        # Set file permissions to 600 (read/write for owner only)
+        os.chmod(API_KEY_FILE, 0o600)
+    except Exception as e:
+        console.print(f"[red]Failed to save API key: {e}[/red]")
+        raise
+
+
+def authenticate_user(client_id: str = "finnatunnel-cli") -> Optional[str]:
+    """Authenticate user and get API key"""
+    try:
+        # Step 1: Request authentication URL
+        auth_api = f"{API}:8080"
+        with console.status("[bold green]Requesting authentication...", spinner="dots"):
+            response = requests.post(
+                f"{auth_api}/auth/request",
+                data={"client_id": client_id},
+                timeout=10
+            )
+            response.raise_for_status()
+            auth_data = response.json()
+        
+        auth_token = auth_data['auth_token']
+        auth_url = auth_data['auth_url']
+        expires_in = auth_data.get('expires_in', 900)
+        
+        # Display auth URL (matching expose command style)
+        console.clear()
+        console.print("[bold green]Authentication Required[/bold green]\n")
+        console.print(f"[bold cyan]Please visit:[/bold cyan] {auth_url}")
+        console.print(f"[bold cyan]Expires in:[/bold cyan]  {expires_in // 60} minutes")
+        # console.print("\n[dim]Waiting for authentication...[/dim]")
+        
+        # Step 2: Poll for completion
+        start_time = time.time()
+        poll_interval = 1  # Poll every 2 seconds
+        max_wait = expires_in
+        
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > max_wait:
+                console.print("[red]Authentication request expired[/red]")
+                return None
+            
+            try:
+                response = requests.get(
+                    f"{auth_api}/auth/check/{auth_token}?client_id={client_id}",
+                    timeout=5
+                )
+                
+                if response.status_code == 404:
+                    console.print("[red]Authentication request not found[/red]")
+                    return None
+                
+                if response.status_code == 410:
+                    console.print("[red]Authentication request expired[/red]")
+                    return None
+                
+                response.raise_for_status()
+                data = response.json()
+                
+                if data['status'] == 'completed':
+                    api_key = data['api_key']
+                    # Clear the waiting line
+                    console.print(" " * 50, end="\r")
+                    console.print("[green]✓ Authentication successful![/green]")
+                    
+                    # Save API key locally
+                    save_api_key(api_key)
+                    console.print(f"[green]API key saved to {API_KEY_FILE}[/green]")
+                    
+                    return api_key
+                
+                # Still pending, show status
+                remaining = int(max_wait - elapsed)
+                console.print(f"[dim]Waiting for authentication... ({remaining}s remaining)[/dim]", end="\r")
+                
+            except requests.exceptions.RequestException as e:
+                console.print(f"[yellow]Error checking status: {e}[/yellow]")
+            
+            time.sleep(poll_interval)
+            
+    except requests.exceptions.RequestException as e:
+        console.print(f"[red]Authentication failed: {e}[/red]")
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_detail = e.response.json()
+                console.print(f"[red]Error details: {error_detail}[/red]")
+            except:
+                console.print(f"[red]Response: {e.response.text}[/red]")
+        return None
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Authentication cancelled[/yellow]")
+        return None
+
 
 # ==================== Utility Functions ====================
 
@@ -695,15 +831,15 @@ async def monitoring_dashboard_handler(request):
         
         html, body {
             font-family: monospace;
-            background: #ffffff !important;
-            color: #24292f;
+            background: #000000 !important;
+            color: #e0e0e0;
             font-size: 14px;
             line-height: 1.5;
             margin: 0;
             overflow: auto !important;
         }
         
-        /* Prevent browser extensions from injecting dark backgrounds */
+        /* Prevent browser extensions from injecting light backgrounds */
         body::before,
         body::after,
         html::before,
@@ -714,16 +850,16 @@ async def monitoring_dashboard_handler(request):
         }
         
         .container {
-            max-width: 1600px;
-            margin: 0 auto;
-            background: #ffffff !important;
+            max-width: 100%;
+            margin: 0;
+            background: #000000 !important;
             position: relative;
             z-index: 1;
             padding: 20px;
         }
         
         .header {
-            border-bottom: 1px solid #d0d7de;
+            border-bottom: none;
             padding-bottom: 16px;
             margin-bottom: 20px;
         }
@@ -731,18 +867,18 @@ async def monitoring_dashboard_handler(request):
         .header h1 {
             font-size: 24px;
             font-weight: 600;
-            color: #24292f;
+            color: #ffffff;
             margin-bottom: 4px;
         }
         
         .header p {
-            color: #57606a;
+            color: #a0a0a0;
             font-size: 14px;
         }
         
         .controls {
-            background: #f6f8fa;
-            border: 1px solid #d0d7de;
+            background: #1a1a1a;
+            border: none;
             border-radius: 6px;
             padding: 12px;
             margin-bottom: 16px;
@@ -755,9 +891,9 @@ async def monitoring_dashboard_handler(request):
         .controls input,
         .controls select {
             padding: 6px 12px;
-            border: 1px solid #d0d7de;
-            background: #ffffff;
-            color: #24292f;
+            border: none;
+            background: #0a0a0a;
+            color: #e0e0e0;
             border-radius: 6px;
             font-size: 14px;
             font-family: inherit;
@@ -767,18 +903,17 @@ async def monitoring_dashboard_handler(request):
         
         .controls input:focus,
         .controls select:focus {
-            outline: none;
-            border-color: #0969da;
-            box-shadow: 0 0 0 3px rgba(9, 105, 218, 0.1);
+            outline: 1px solid #4a9eff;
+            box-shadow: 0 0 0 2px rgba(74, 158, 255, 0.2);
         }
         
         .controls input::placeholder {
-            color: #8c959f;
+            color: #666666;
         }
         
         .controls button {
             padding: 6px 16px;
-            border: 1px solid #d0d7de;
+            border: none;
             border-radius: 6px;
             font-size: 14px;
             font-weight: 500;
@@ -788,23 +923,23 @@ async def monitoring_dashboard_handler(request):
         }
         
         .btn-primary {
-            background: #0969da;
-            color: #ffffff;
-            border-color: #0969da;
+            background: #4a9eff;
+            color: #000000;
+            border: none;
         }
         
         .btn-primary:hover {
-            background: #0860ca;
-            border-color: #0860ca;
+            background: #5aaeff;
         }
         
         .btn-secondary {
-            background: #ffffff;
-            color: #24292f;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            border: none;
         }
         
         .btn-secondary:hover {
-            background: #f6f8fa;
+            background: #2a2a2a;
         }
         
         .metrics {
@@ -815,14 +950,14 @@ async def monitoring_dashboard_handler(request):
         }
         
         .metric-card {
-            background: #f6f8fa;
-            border: 1px solid #d0d7de;
+            background: #1a1a1a;
+            border: none;
             border-radius: 6px;
             padding: 16px;
         }
         
         .metric-label {
-            color: #57606a;
+            color: #a0a0a0;
             font-size: 12px;
             font-weight: 500;
             text-transform: uppercase;
@@ -831,31 +966,31 @@ async def monitoring_dashboard_handler(request):
         }
         
         .metric-value {
-            color: #24292f;
+            color: #ffffff;
             font-size: 28px;
             font-weight: 600;
             font-variant-numeric: tabular-nums;
         }
         
         .metric-card.success .metric-value {
-            color: #1a7f37;
+            color: #4ade80;
         }
         
         .metric-card.error .metric-value {
-            color: #cf222e;
+            color: #f87171;
         }
         
         .requests-table-container {
-            background: #ffffff;
-            border: 1px solid #d0d7de;
+            background: #0a0a0a;
+            border: none;
             border-radius: 6px;
             overflow: hidden;
         }
         
         .table-header {
             padding: 12px 16px;
-            border-bottom: 1px solid #d0d7de;
-            background: #f6f8fa;
+            border-bottom: none;
+            background: #1a1a1a;
             display: flex;
             justify-content: space-between;
             align-items: center;
@@ -864,7 +999,7 @@ async def monitoring_dashboard_handler(request):
         .table-header h2 {
             font-size: 16px;
             font-weight: 600;
-            color: #24292f;
+            color: #ffffff;
         }
         
         .table-wrapper {
@@ -877,30 +1012,30 @@ async def monitoring_dashboard_handler(request):
         }
         
         thead {
-            background: #f6f8fa;
+            background: #1a1a1a;
         }
         
         th {
             padding: 10px 12px;
             text-align: left;
-            color: #57606a;
+            color: #a0a0a0;
             font-weight: 600;
             font-size: 12px;
             text-transform: uppercase;
-            border-bottom: 1px solid #d0d7de;
+            border-bottom: none;
         }
         
         tbody tr {
-            border-bottom: 1px solid #d0d7de;
+            border-bottom: none;
         }
         
         tbody tr:hover {
-            background: #f6f8fa;
+            background: #1a1a1a;
         }
         
         td {
             padding: 10px 12px;
-            color: #24292f;
+            color: #e0e0e0;
             font-size: 13px;
         }
         
@@ -914,28 +1049,28 @@ async def monitoring_dashboard_handler(request):
         }
         
         .method-GET {
-            background: #dafbe1;
-            color: #1a7f37;
+            background: #1a4d2e;
+            color: #4ade80;
         }
         
         .method-POST {
-            background: #ddf4ff;
-            color: #0969da;
+            background: #1e3a5f;
+            color: #60a5fa;
         }
         
         .method-PUT {
-            background: #fff8c5;
-            color: #9a6700;
+            background: #4a3d1a;
+            color: #fbbf24;
         }
         
         .method-DELETE {
-            background: #ffebe9;
-            color: #cf222e;
+            background: #4a1e1e;
+            color: #f87171;
         }
         
         .method-PATCH {
-            background: #f3dfff;
-            color: #8250df;
+            background: #3a1e4a;
+            color: #a78bfa;
         }
         
         .status-badge {
@@ -947,28 +1082,28 @@ async def monitoring_dashboard_handler(request):
         }
         
         .status-2xx {
-            background: #dafbe1;
-            color: #1a7f37;
+            background: #1a4d2e;
+            color: #4ade80;
         }
         
         .status-3xx {
-            background: #fff8c5;
-            color: #9a6700;
+            background: #4a3d1a;
+            color: #fbbf24;
         }
         
         .status-4xx {
-            background: #ffebe9;
-            color: #cf222e;
+            background: #4a1e1e;
+            color: #f87171;
         }
         
         .status-5xx {
-            background: #ffebe9;
-            color: #cf222e;
+            background: #4a1e1e;
+            color: #f87171;
         }
         
         .path-cell {
             font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
-            color: #24292f;
+            color: #e0e0e0;
             max-width: 500px;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -977,7 +1112,7 @@ async def monitoring_dashboard_handler(request):
         
         .latency-cell {
             font-variant-numeric: tabular-nums;
-            color: #57606a;
+            color: #a0a0a0;
         }
         
         .action-buttons {
@@ -986,7 +1121,7 @@ async def monitoring_dashboard_handler(request):
         }
         
         .btn-link {
-            color: #0969da;
+            color: #4a9eff;
             text-decoration: none;
             font-size: 13px;
         }
@@ -997,10 +1132,10 @@ async def monitoring_dashboard_handler(request):
         
         .request-details {
             display: none;
-            background: #f6f8fa;
+            background: #1a1a1a;
             padding: 16px;
             margin: 8px 12px;
-            border: 1px solid #d0d7de;
+            border: none;
             border-radius: 6px;
             font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
             font-size: 12px;
@@ -1012,7 +1147,7 @@ async def monitoring_dashboard_handler(request):
         }
         
         .request-details h4 {
-            color: #24292f;
+            color: #ffffff;
             margin-bottom: 8px;
             font-size: 12px;
             font-weight: 600;
@@ -1026,12 +1161,12 @@ async def monitoring_dashboard_handler(request):
         }
         
         .request-details pre {
-            background: #ffffff;
+            background: #0a0a0a;
             padding: 12px;
-            border: 1px solid #d0d7de;
+            border: none;
             border-radius: 6px;
             overflow-x: auto;
-            color: #24292f;
+            color: #e0e0e0;
             margin-bottom: 12px;
             font-size: 11px;
             white-space: pre-wrap;
@@ -1041,7 +1176,7 @@ async def monitoring_dashboard_handler(request):
         .empty-state {
             text-align: center;
             padding: 40px 20px;
-            color: #8c959f;
+            color: #666666;
         }
         
         @media (max-width: 768px) {
@@ -1123,7 +1258,7 @@ async def monitoring_dashboard_handler(request):
         <div class="requests-table-container">
             <div class="table-header">
                 <h2>Request History</h2>
-                <span id="request-count" style="color: #57606a; font-size: 13px;">0 requests</span>
+                <span id="request-count" style="color: #a0a0a0; font-size: 13px;">0 requests</span>
             </div>
             <div class="table-wrapper">
                 <table>
@@ -1196,12 +1331,12 @@ async def monitoring_dashboard_handler(request):
             tr.dataset.requestId = request.id;
             const statusClass = getStatusClass(request.status_code);
             tr.innerHTML = `
-                <td style="color: #57606a; font-variant-numeric: tabular-nums;">${formatTime(request.timestamp)}</td>
+                <td style="color: #a0a0a0; font-variant-numeric: tabular-nums;">${formatTime(request.timestamp)}</td>
                 <td><span class="method method-${request.method}">${request.method}</span></td>
                 <td><div class="path-cell" title="${request.path}">${request.path}</div></td>
                 <td><span class="status-badge ${statusClass}">${request.status_code}</span></td>
                 <td class="latency-cell">${request.latency_ms.toFixed(2)} ms</td>
-                <td style="color: #57606a;">${formatBytes(request.response_body_size)}</td>
+                <td style="color: #a0a0a0;">${formatBytes(request.response_body_size)}</td>
                 <td>
                     <div class="action-buttons">
                         <a href="#" class="btn-link" onclick="toggleDetails('${request.id}'); return false;">View</a>
@@ -1469,7 +1604,7 @@ async def tunnel_connection(subdomain: str, local_host: str, local_port: int, pr
 
 def create_status_table() -> Table:
     """Create a live status table for the tunnel"""
-    table = Table(box=box.SIMPLE, show_header=False, pad_edge=False, padding=(0, 1))
+    table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 1))
     table.add_column("", style="dim", no_wrap=True, width=20)
     table.add_column("", style="", justify="right", width=15)
     
@@ -1499,7 +1634,7 @@ def create_status_table() -> Table:
 
 def create_tcp_status_table() -> Table:
     """Create a simpler status table for TCP tunnels"""
-    table = Table(box=box.SIMPLE, show_header=False, pad_edge=False, padding=(0, 1))
+    table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 1))
     table.add_column("", style="dim", no_wrap=True, width=20)
     table.add_column("", style="", justify="right", width=15)
     
@@ -1512,21 +1647,44 @@ def create_tcp_status_table() -> Table:
     return table
 
 
+def create_combined_display(protocol: str):
+    """Create a combined display with tunnel info and status table"""
+    # Build tunnel info as rendered text
+    info_parts = []
+    if tunnel_info:
+        info_parts.append(Text.from_markup("[bold green]Tunnel Active[/bold green]"))
+        info_parts.append(Text())
+        for key, value in tunnel_info.items():
+            if key != "monitor_url":
+                info_parts.append(Text.from_markup(value))
+        if tunnel_info.get("monitor_url"):
+            info_parts.append(Text())
+            info_parts.append(Text.from_markup(f"[green]Monitoring dashboard:[/green] [bold]{tunnel_info['monitor_url']}[/bold]"))
+        info_parts.append(Text())
+        info_parts.append(Text.from_markup("[dim]Press Ctrl+C to close the tunnel[/dim]"))
+        info_parts.append(Text())
+    
+    # Get status table
+    if protocol == "tcp":
+        status_table = create_tcp_status_table()
+    else:
+        status_table = create_status_table()
+    
+    # Combine into Group
+    if tunnel_info:
+        return Group(*info_parts, status_table)
+    else:
+        return status_table
+
+
 async def status_dashboard_loop(protocol: str):
     """Display live status dashboard"""
     try:
-        if protocol == "tcp":
-            # For TCP, show simpler status
-            with Live(create_tcp_status_table(), refresh_per_second=2, console=console, screen=False, vertical_overflow="visible") as live:
-                while True:
-                    live.update(create_tcp_status_table())
-                    await asyncio.sleep(0.5)
-        else:
-            # For HTTP, show detailed metrics
-            with Live(create_status_table(), refresh_per_second=2, console=console, screen=False, vertical_overflow="visible") as live:
-                while True:
-                    live.update(create_status_table())
-                    await asyncio.sleep(0.5)
+        # Use combined display with screen=True to properly replace content
+        with Live(create_combined_display(protocol), refresh_per_second=2, console=console, screen=True, vertical_overflow="visible") as live:
+            while True:
+                live.update(create_combined_display(protocol))
+                await asyncio.sleep(0.5)
     except asyncio.CancelledError:
         pass
 
@@ -1545,7 +1703,7 @@ def list_tunnels():
             console.print("[yellow]No active tunnels[/yellow]")
             return
 
-        table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
+        table = Table(box=None, show_header=True, header_style="bold")
         table.add_column("Subdomain", style="cyan", no_wrap=True)
         table.add_column("Target", style="")
         table.add_column("URL", style="blue", overflow="fold")
@@ -1561,7 +1719,6 @@ def list_tunnels():
                 tunnel.get("url", "N/A"),
                 status_text
             )
-
         console.print(table)
     except requests.exceptions.RequestException as e:
         console.print(f"[red]Failed to list tunnels: {e}[/red]")
@@ -1589,36 +1746,27 @@ def expose_tunnel(target: str, subdomain: Optional[str] = None, protocol: str = 
             data = r.json()
             tunnel_subdomain = data.get("subdomain") or data['url'].split("//")[1].split(".")[0]
 
-        # Create info panel
-        info_lines = [
-            f"[bold cyan]Subdomain:[/bold cyan] {tunnel_subdomain}",
-            f"[bold cyan]Target:[/bold cyan]    {target}",
-            f"[bold cyan]Protocol:[/bold cyan]  {protocol.upper()}",
-        ]
+        # Store tunnel info globally for status dashboard
+        global tunnel_info
+        tunnel_info = {
+            "subdomain": f"[bold cyan]Subdomain:[/bold cyan] {tunnel_subdomain}",
+            "target": f"[bold cyan]Target:[/bold cyan]    {target}",
+            "protocol": f"[bold cyan]Protocol:[/bold cyan]  {protocol.upper()}",
+        }
         
         if latency_ms:
-            info_lines.append(f"[bold cyan]Latency:[/bold cyan]   {latency_ms:.2f} ms")
+            tunnel_info["latency"] = f"[bold cyan]Latency:[/bold cyan]   {latency_ms:.2f} ms"
         else:
-            info_lines.append(f"[bold cyan]Latency:[/bold cyan]   N/A")
+            tunnel_info["latency"] = f"[bold cyan]Latency:[/bold cyan]   N/A"
         
         if protocol != "tcp":
             http_url = data.get('url', '')
             https_url = http_url.replace('http://', 'https://') if http_url else ''
-            info_lines.append(f"[bold cyan]HTTP:[/bold cyan]     {http_url}")
-            info_lines.append(f"[bold cyan]HTTPS:[/bold cyan]    {https_url}")
+            tunnel_info["http"] = f"[bold cyan]HTTP:[/bold cyan]     {http_url}"
+            tunnel_info["https"] = f"[bold cyan]HTTPS:[/bold cyan]    {https_url}"
         
         if data.get("tcp"):
-            info_lines.append(f"[bold cyan]TCP:[/bold cyan]      {data['tcp']}")
-        
-        info_panel = Panel(
-            "\n".join(info_lines),
-            title="[bold green]Tunnel Active[/bold green]",
-            border_style="green",
-            padding=(1, 2)
-        )
-        
-        console.print(info_panel)
-        console.print("[dim]Press Ctrl+C to close the tunnel[/dim]")
+            tunnel_info["tcp"] = f"[bold cyan]TCP:[/bold cyan]      {data['tcp']}"
 
         return tunnel_subdomain
     except requests.exceptions.RequestException as e:
@@ -1658,6 +1806,7 @@ def main():
   finna expose localhost:22 --tcp              # Expose TCP service (SSH)
   finna expose localhost:80 --monitor          # Enable monitoring dashboard
   finna expose localhost:80 --monitor-port 8080  # Custom monitor port
+  finna auth                                   # Authenticate and get API key
   finna list                                   # List all tunnels
   finna delete user-12345                      # Delete a tunnel
         """,
@@ -1686,16 +1835,36 @@ def main():
     delete_parser = subparsers.add_parser("delete", help="Delete a tunnel")
     delete_parser.add_argument("subdomain", help="Subdomain of tunnel to delete")
 
+    # Auth command
+    auth_parser = subparsers.add_parser("auth", help="Authenticate and get API key")
+    auth_parser.add_argument("--client-id", default="finnatunnel-cli", help="Client ID for authentication")
+
     args = parser.parse_args()
 
     if not args.command:
         console.print(Panel(parser.format_help(), title="[bold cyan]FinnaCloud Tunnel CLI[/bold cyan]", border_style="blue"))
         return
 
-    # Validate API key
+    # Handle auth command (doesn't need API key)
+    if args.command == "auth":
+        api_key = authenticate_user(args.client_id)
+        if api_key:
+            console.print("\n[green]Authentication complete! You can now use tunnel commands.[/green]")
+            sys.exit(0)
+        else:
+            console.print("\n[red]Authentication failed[/red]")
+            sys.exit(1)
+
+    # Get API key for other commands and set as global
+    global KEY
+    KEY = get_api_key()
+    
+    # Validate API key for commands that need it
     if not KEY:
         console.print("[red]Error: API key not found[/red]")
-        console.print("[yellow]Please set the finnaconnect_token environment variable[/yellow]")
+        console.print("[yellow]Please authenticate first using:[/yellow]")
+        console.print("[bold]  finna auth[/bold]")
+        console.print("\n[dim]Or set the finnaconnect_token environment variable[/dim]")
         console.print("[dim]Example: export finnaconnect_token=your_api_key[/dim]")
         sys.exit(1)
 
@@ -1759,7 +1928,7 @@ def main():
                 if args.monitor and protocol == "http":
                     runner, actual_monitor_port = await start_monitoring_dashboard(monitor_port)
                     if actual_monitor_port:
-                        console.print(f"[green]Monitoring dashboard:[/green] [bold]http://127.0.0.1:{actual_monitor_port}[/bold]")
+                        tunnel_info["monitor_url"] = f"http://127.0.0.1:{actual_monitor_port}"
                 
                 # Start tunnel connection
                 tunnel_task = asyncio.create_task(

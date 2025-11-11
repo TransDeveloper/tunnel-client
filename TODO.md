@@ -14,7 +14,7 @@
 - Add unit and integration tests for CLI.
 - Enhance documentation with examples and edge cases.
 
-- HTTP/2 + HTTP/3 support.
-- Streaming large file uploads/downloads without buffering entirely in memory.
-- Thread or process pools for high-throughput TCP forwarding
-- Per-connection ACLs
+<!-- - HTTP/2 + HTTP/3 support. -->
+<!-- - Streaming large file uploads/downloads without buffering entirely in memory. -->
+<!-- - Thread or process pools for high-throughput TCP forwarding -->
+<!-- - Per-connection ACLs -->
